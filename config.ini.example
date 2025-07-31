@@ -1,0 +1,37 @@
+# TVHeadEnd M3U Sync Configuration File
+# Copy this file to config.ini and configure your settings
+# Environment variables take precedence over this file
+
+[tvheadend]
+# TVHeadEnd server URL
+url = http://localhost:9981
+
+# Authentication credentials (prefer environment variables for security)
+username = admin
+password = your_password_here
+
+# Network name for IPTV channels
+network_name = IPTV Network
+
+# M3U playlist file path
+m3u_file = /path/to/your/playlist.m3u
+
+# Authentication type: digest (default) or basic
+auth_type = digest
+
+[logging]
+# Log level: DEBUG, INFO, WARNING, ERROR
+level = INFO
+
+# Log file path (optional, logs to console if not specified)
+file = /var/log/tvheadend_m3u_sync.log
+
+# Use JSON format for structured logging
+json_format = false
+
+[network]
+# HTTP timeout in seconds
+timeout = 30
+
+# Maximum retries for failed requests
+max_retries = 3
