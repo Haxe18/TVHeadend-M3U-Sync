@@ -45,6 +45,10 @@ def signal_handler(signum, frame):
     logger = logging.getLogger('tvheadend_m3u_sync')
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     _shutdown_requested = True
+    # Force exit on second Ctrl+C
+    if _shutdown_requested:
+        logger.info("Forcing exit...")
+        sys.exit(1)
 
 
 def check_shutdown():
@@ -52,7 +56,7 @@ def check_shutdown():
     if _shutdown_requested:
         logger = logging.getLogger('tvheadend_m3u_sync')
         logger.info("Shutdown requested, exiting...")
-        sys.exit(128 + signal.SIGTERM)
+        sys.exit(0)
 
 
 # ==================== CONFIGURATION MANAGEMENT ====================
@@ -339,7 +343,7 @@ class Parser:
 
         # Read original file line by line and preserve all content
         logger.debug(f"Preserving original content and updating UUIDs for {len(entries)} entries")
-        
+
         with open(m3u_file, 'r', encoding='utf-8') as original_file:
             original_lines = original_file.readlines()
 
@@ -348,7 +352,7 @@ class Parser:
             i = 0
             while i < len(original_lines):
                 line = original_lines[i].strip()
-                
+
                 # Check if this is an EXTINF line that matches one of our entries
                 if line.startswith("#EXTINF:"):
                     # Find matching entry
@@ -357,20 +361,20 @@ class Parser:
                         if entry.xtinf.strip() == line:
                             matching_entry = entry
                             break
-                    
+
                     # If we found a matching entry and it has a UUID to add/update
                     if matching_entry and matching_entry.tvh_uuid:
                         idx = line.rfind(",")
                         if idx > 0:
                             x = line[:idx]
                             current_uuid = Parser._get_tvh_uuid(line)
-                            
+
                             # Add or update UUID
                             if current_uuid is None:
                                 x = f'{x} {Parser.TVH_UUID}{matching_entry.tvh_uuid}"'
                             else:
                                 x = x.replace(f'{Parser.TVH_UUID}{current_uuid}"', f'{Parser.TVH_UUID}{matching_entry.tvh_uuid}"')
-                            
+
                             updated_line = f"{x},{matching_entry.name}\n"
                             file.write(updated_line)
                         else:
@@ -382,13 +386,94 @@ class Parser:
                 else:
                     # Not an EXTINF line, write as-is (preserves comments, EXT-X directives, URLs, etc.)
                     file.write(original_lines[i])
-                
+
                 i += 1
 
         logger.info(f"M3U file updated: {m3u_file} (all original content preserved)")
 
 
+# ==================== CHANNEL MAPPING UTILITIES ====================
 
+def normalize_channel_name(name: str) -> str:
+    """Normalize channel name for comparison (case-insensitive, remove special chars)"""
+    if not name:
+        return ""
+
+    # Convert to lowercase
+    normalized = name.lower()
+
+    # Remove file extensions and prefixes
+    # Remove .m3u8, .m3u, .ts, etc.
+    import re
+    normalized = re.sub(r'\.(m3u8?|ts|mp4|avi|mkv)$', '', normalized)
+
+    # Remove common prefixes like "filename - " or "filename.m3u8 - "
+    normalized = re.sub(r'^[^-]*\.m3u8?\s*-\s*', '', normalized)
+    normalized = re.sub(r'^[^-]*\s*-\s*', '', normalized)
+
+    # Remove common special characters that might differ between M3U and TVHeadend
+    for char in ['-', '_', '.', ' ', '(', ')', '[', ']', '{', '}']:
+        normalized = normalized.replace(char, '')
+
+    return normalized
+
+
+def find_matching_mux_by_name(entry: Entry, existing_muxes: List[Mux]) -> Optional[Mux]:
+    """Find matching mux by normalized channel name"""
+    logger = logging.getLogger('tvheadend_m3u_sync')
+
+    if not entry.name:
+        return None
+
+    entry_normalized = normalize_channel_name(entry.name)
+    logger.debug(f"Looking for match for: '{entry.name}' (normalized: '{entry_normalized}')")
+
+    for mux in existing_muxes:
+        if mux.name:
+            mux_normalized = normalize_channel_name(mux.name)
+            logger.debug(f"  Comparing with: '{mux.name}' (normalized: '{mux_normalized}')")
+            if entry_normalized == mux_normalized:
+                logger.debug(f"  -> MATCH FOUND!")
+                return mux
+
+    logger.debug(f"  -> No match found for '{entry.name}'")
+    return None
+
+
+def map_channels_by_name(m3u_entries: List[Entry], existing_muxes: List[Mux], dry_run: bool = False) -> Tuple[List[Entry], int]:
+    """Map M3U entries to existing muxes by name and assign UUIDs"""
+    logger = logging.getLogger('tvheadend_m3u_sync')
+    mapped_count = 0
+
+    logger.info(f"Mapping {len(m3u_entries)} M3U entries to {len(existing_muxes)} existing muxes by name...")
+
+    # Show all existing mux names for debugging
+    logger.debug("Existing mux names:")
+    for i, mux in enumerate(existing_muxes):
+        logger.debug(f"  {i+1}. '{mux.name}' (UUID: {mux.uuid})")
+
+    logger.debug("M3U entry names:")
+    for i, entry in enumerate(m3u_entries):
+        if not entry.tvh_uuid:  # Only show entries without UUID
+            logger.debug(f"  {i+1}. '{entry.name}'")
+
+    for entry in m3u_entries:
+        if entry.tvh_uuid:
+            # Entry already has UUID, skip
+            continue
+
+        matching_mux = find_matching_mux_by_name(entry, existing_muxes)
+        if matching_mux:
+            entry.tvh_uuid = matching_mux.uuid
+            mapped_count += 1
+            logger.info(f"Mapped by name: '{entry.name}' -> '{matching_mux.name}' (UUID: {matching_mux.uuid})")
+
+    if mapped_count > 0:
+        logger.info(f"Successfully mapped {mapped_count} channels by name")
+    else:
+        logger.info("No channels mapped by name")
+
+    return m3u_entries, mapped_count
 
 
 # ==================== TVHEADEND CLIENT ====================
@@ -704,6 +789,8 @@ Examples:
     parser.add_argument('--json-log', action='store_true', help='Use JSON log format')
     parser.add_argument('--timeout', type=int, default=30, help='HTTP request timeout in seconds')
     parser.add_argument('--dry-run', action='store_true', help='Preview changes without applying them')
+    parser.add_argument('--map-by-name', action='store_true', help='Map channels by name when syncing to existing muxes')
+    parser.add_argument('--uuid-dry-run', action='store_true', help='Interactive UUID assignment mode: map channels by name and assign existing mux UUIDs to M3U entries with user confirmation')
 
 
     args = parser.parse_args()
@@ -714,6 +801,45 @@ Examples:
         sys.exit(1)
 
     return args
+
+
+# ==================== USER INTERACTION ====================
+
+def confirm_uuid_assignment(m3u_entries: List[Entry], existing_muxes: List[Mux]) -> bool:
+    """Ask user for confirmation to assign UUIDs in dry run mode"""
+    logger = logging.getLogger('tvheadend_m3u_sync')
+
+    # Count entries that would get UUIDs assigned
+    entries_without_uuid = [e for e in m3u_entries if not e.tvh_uuid]
+    if not entries_without_uuid:
+        logger.info("No entries need UUID assignment")
+        return False
+
+    logger.info(f"Found {len(entries_without_uuid)} entries in m3u file without UUIDs")
+    logger.info(f"Found {len(existing_muxes)} existing muxes for potential mapping")
+
+    print(f"\nWould you like to assign UUIDs to {len(entries_without_uuid)} entries based on existing muxes?")
+    print("This will map channels by name and assign corresponding UUIDs.")
+
+    while True:
+        try:
+            check_shutdown()  # Check for graceful shutdown before input
+            response = input("Proceed with UUID assignment? (y/n): ").strip().lower()
+            if response in ['y', 'yes']:
+                return True
+            elif response in ['n', 'no']:
+                return False
+            else:
+                print("Please enter 'y' or 'n'")
+        except KeyboardInterrupt:
+            print()  # New line after Ctrl+C
+            logger.info("UUID assignment cancelled by user (Ctrl+C)")
+            return False
+        except EOFError:
+            # Handle Ctrl+D
+            print()
+            logger.info("UUID assignment cancelled by user (EOF)")
+            return False
 
 
 # ==================== MAIN PROGRAM ====================
@@ -731,7 +857,7 @@ def main():
 
         # Setup logging with new options
         setup_logging(
-            verbose=args.verbose, 
+            verbose=args.verbose,
             log_file=getattr(args, 'log_file', None),
             json_format=getattr(args, 'json_log', False)
         )
@@ -877,6 +1003,58 @@ def sync_mode(args, config: Config):
     muxes = client.get_muxes()
     network_muxes = [mux for mux in muxes if mux.network_uuid == current_network.uuid]
     logger.info(f"Found {len(network_muxes)} existing muxes in network")
+
+        # Handle UUID dry run mode
+    if getattr(args, 'uuid_dry_run', False):
+        logger.info("UUID dry run mode enabled")
+        if confirm_uuid_assignment(m3u_entries, network_muxes):
+            # Map channels by name and assign UUIDs (NOT in dry run mode for actual assignment)
+            m3u_entries, mapped_count = map_channels_by_name(m3u_entries, network_muxes, dry_run=False)
+
+            if mapped_count > 0:
+                logger.info(f"Assigned UUIDs to {mapped_count} entries")
+                # Show what was updated
+                for entry in m3u_entries:
+                    if entry.tvh_uuid:
+                        logger.info(f"Assigned UUID {entry.tvh_uuid} to: {entry.name}")
+
+                # Ask if user wants to actually update the M3U file
+                print(f"\nWould you like to update the M3U file with these UUID assignments?")
+                while True:
+                    try:
+                        check_shutdown()  # Check for graceful shutdown before input
+                        response = input("Update M3U file with UUIDs? (y/n): ").strip().lower()
+                        if response in ['y', 'yes']:
+                            logger.info("Updating M3U file with UUID assignments...")
+                            Parser.write_file(m3u_file, m3u_entries, dry_run=False)
+                            logger.info("M3U file updated successfully")
+                            break
+                        elif response in ['n', 'no']:
+                            logger.info("M3U file update cancelled")
+                            break
+                        else:
+                            print("Please enter 'y' or 'n'")
+                    except KeyboardInterrupt:
+                        print()  # New line after Ctrl+C
+                        logger.info("M3U file update cancelled by user (Ctrl+C)")
+                        break
+                    except EOFError:
+                        # Handle Ctrl+D
+                        print()
+                        logger.info("M3U file update cancelled by user (EOF)")
+                        break
+            else:
+                logger.info("No UUID assignments would be made")
+        else:
+            logger.info("UUID assignment cancelled by user")
+        return
+
+    # Handle name-based mapping for existing muxes
+    if getattr(args, 'map_by_name', False) and network_muxes:
+        logger.info("Name-based mapping enabled for existing muxes")
+        m3u_entries, mapped_count = map_channels_by_name(m3u_entries, network_muxes, dry_run=args.dry_run)
+        if mapped_count > 0:
+            logger.info(f"Mapped {mapped_count} channels by name to existing muxes")
 
 
     # Update existing muxes

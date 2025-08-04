@@ -8,6 +8,8 @@ A Python tool to synchronize M3U playlist files with TVHeadend server with impro
 - **Channels and muxes are UPDATED, not recreated** - existing channel UUIDs are preserved
 - **No channel duplication** - updates existing channels instead of creating new ones
 - **Seamless re-sync** - run multiple times without losing channel configurations
+- **Name-based mapping** - automatically map channels by name when syncing to existing muxes
+- **Interactive UUID assignment** - assign existing mux UUIDs to M3U entries with user confirmation
 
 ### 📡 **Complete M3U Management**
 - Parse M3U playlist files with robust error handling
@@ -39,7 +41,7 @@ export TVH_NETWORK="IPTV Network"
 export TVH_M3U_FILE="/path/to/playlist.m3u"
 
 # Run sync
-python tvheadend_m3u_sync.py sync
+python tvheadend_m3u_sync.py
 ```
 
 ### Command Line Interface
@@ -57,6 +59,10 @@ python tvheadend_m3u_sync.py [options]
 - `-p, --password` - Password (prefer TVH_PASSWORD env var)
 - `--basic-auth` - Use basic auth instead of digest
 
+**Sync Options:**
+- `--map-by-name` - Map channels by name when syncing to existing muxes
+- `--uuid-dry-run` - Interactive UUID assignment mode: map channels by name and assign existing mux UUIDs to M3U entries with user confirmation
+
 **Global Options:**
 - `-v, --verbose` - Enable debug logging
 - `--version` - Show version information
@@ -65,8 +71,6 @@ python tvheadend_m3u_sync.py [options]
 - `--json-log` - Use JSON log format for structured logging
 - `--timeout <seconds>` - HTTP request timeout (default: 30)
 - `--dry-run` - Preview changes without applying them
-
-
 
 ### Configuration Methods (Priority Order)
 
@@ -92,6 +96,15 @@ python tvheadend_m3u_sync.py --verbose
 python tvheadend_m3u_sync.py --dry-run --verbose
 ```
 
+### Name-based Channel Mapping
+```bash
+# Map channels by name when syncing to existing muxes
+python tvheadend_m3u_sync.py -m playlist.m3u -n "IPTV Network" --url http://tvheadend:9981 --map-by-name
+
+# Interactive UUID assignment with user confirmation
+python tvheadend_m3u_sync.py -m playlist.m3u -n "IPTV Network" --url http://tvheadend:9981 --uuid-dry-run
+```
+
 ### Configuration File
 ```bash
 # Create config.ini (copy from config.ini.example)
@@ -111,11 +124,33 @@ python tvheadend_m3u_sync.py -m my_channels.m3u --url http://tvheadend:9981  # N
 
 # Sync with structured JSON logging
 python tvheadend_m3u_sync.py -m playlist.m3u -n "IPTV Network" --json-log --log-file sync.log
-
-
 ```
 
+## Advanced Features
 
+### Name-based Channel Mapping (`--map-by-name`)
+Automatically maps M3U entries to existing TVHeadend muxes by normalized channel names. This is useful when:
+- You have existing channels in TVHeadend
+- You want to sync a new M3U file without recreating channels
+- Channel names are similar but may have slight differences
+
+**How it works:**
+1. Normalizes channel names (removes special characters, case-insensitive)
+2. Removes file extensions and prefixes (e.g., "filename.m3u8 - Channel Name" → "Channel Name")
+3. Matches M3U entries to existing muxes by normalized names
+4. Assigns existing mux UUIDs to M3U entries
+
+### Interactive UUID Assignment (`--uuid-dry-run`)
+Interactive mode for assigning existing mux UUIDs to M3U entries:
+1. **First prompt**: "Proceed with UUID assignment?" (y/n)
+2. **If yes**: Maps channels by name and assigns UUIDs
+3. **Second prompt**: "Update M3U file with UUIDs?" (y/n)
+4. **If yes**: Updates M3U file with assigned UUIDs
+
+**Use cases:**
+- Prepare M3U files with correct UUIDs for future syncs
+- Fix UUID mismatches between M3U and TVHeadend
+- Batch assign UUIDs to multiple channels
 
 ## Configuration
 
@@ -225,6 +260,50 @@ pipe://ffmpeg
 - RTMP/RTSP: `rtmp://server/stream`
 - File paths: `/path/to/file.ts`
 
+## Production Deployment
+
+### Docker Deployment
+```dockerfile
+FROM python:3.9-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY tvheadend_m3u_sync.py .
+COPY config.ini.example config.ini
+
+ENTRYPOINT ["python", "tvheadend_m3u_sync.py"]
+```
+
+### Systemd Service
+```ini
+[Unit]
+Description=TVHeadend M3U Sync
+After=network.target
+
+[Service]
+Type=oneshot
+User=tvheadend
+Environment=TVH_URL=http://localhost:9981
+Environment=TVH_USERNAME=admin
+Environment=TVH_PASSWORD=password
+Environment=TVH_NETWORK=IPTV Network
+Environment=TVH_M3U_FILE=/var/lib/tvheadend/playlist.m3u
+ExecStart=/usr/bin/python3 /opt/tvheadend_m3u_sync.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Cron Job
+```bash
+# Sync every hour
+0 * * * * /usr/bin/python3 /opt/tvheadend_m3u_sync.py --log-file /var/log/tvheadend_sync.log
+```
+
 ## Notes
 
 - TVH-UUID tags are added to M3U entries for tracking
@@ -238,6 +317,8 @@ pipe://ffmpeg
 - **Smart M3U parsing** - only processes EXTINF entries, ignores EXT-X-* directives
 - **Dry run mode** - test changes before applying them
 - **User-Agent** - proper HTTP identification
+- **Graceful shutdown** - handles Ctrl+C properly
+- **Interactive modes** - user confirmation for critical operations
 
 ## Troubleshooting
 
@@ -268,7 +349,11 @@ python tvheadend_m3u_sync.py --timeout 60
 python tvheadend_m3u_sync.py --config config.ini --dry-run
 ```
 
-
+**Name Mapping Issues**
+```bash
+# Debug name mapping with verbose output
+python tvheadend_m3u_sync.py --map-by-name --verbose
+```
 
 ### Error Codes
 - `0`: Success
@@ -287,6 +372,7 @@ This Python version is based on the original [.NET C# implementation by hagaygo]
 - ⚙️ **Configuration**: Config file support, validation  
 - 📊 **Logging**: Structured logging, JSON format, error handling
 - 🔄 **Reliability**: Retry logic, graceful shutdown, timeout handling
+- 🎯 **Smart Mapping**: Name-based channel mapping and interactive UUID assignment
 
 ## License
 
