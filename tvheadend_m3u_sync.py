@@ -444,6 +444,7 @@ def map_channels_by_name(m3u_entries: List[Entry], existing_muxes: List[Mux], dr
     """Map M3U entries to existing muxes by name and assign UUIDs"""
     logger = logging.getLogger('tvheadend_m3u_sync')
     mapped_count = 0
+    corrected_count = 0
 
     logger.info(f"Mapping {len(m3u_entries)} M3U entries to {len(existing_muxes)} existing muxes by name...")
 
@@ -458,22 +459,31 @@ def map_channels_by_name(m3u_entries: List[Entry], existing_muxes: List[Mux], dr
             logger.debug(f"  {i+1}. '{entry.name}'")
 
     for entry in m3u_entries:
-        if entry.tvh_uuid:
-            # Entry already has UUID, skip
-            continue
-
         matching_mux = find_matching_mux_by_name(entry, existing_muxes)
+
         if matching_mux:
-            entry.tvh_uuid = matching_mux.uuid
-            mapped_count += 1
-            logger.info(f"Mapped by name: '{entry.name}' -> '{matching_mux.name}' (UUID: {matching_mux.uuid})")
+            if not entry.tvh_uuid:
+                # Entry has no UUID, assign one
+                entry.tvh_uuid = matching_mux.uuid
+                mapped_count += 1
+                logger.info(f"Mapped by name: '{entry.name}' -> '{matching_mux.name}' (UUID: {matching_mux.uuid})")
+            elif entry.tvh_uuid != matching_mux.uuid:
+                # Entry has wrong UUID, correct it
+                old_uuid = entry.tvh_uuid
+                entry.tvh_uuid = matching_mux.uuid
+                corrected_count += 1
+                logger.info(f"Corrected UUID: '{entry.name}' {old_uuid} -> {matching_mux.uuid}")
 
-    if mapped_count > 0:
-        logger.info(f"Successfully mapped {mapped_count} channels by name")
+    total_changes = mapped_count + corrected_count
+    if total_changes > 0:
+        if mapped_count > 0:
+            logger.info(f"Successfully mapped {mapped_count} channels by name")
+        if corrected_count > 0:
+            logger.info(f"Corrected {corrected_count} incorrect UUIDs")
     else:
-        logger.info("No channels mapped by name")
+        logger.info("No channels mapped or corrected by name")
 
-    return m3u_entries, mapped_count
+    return m3u_entries, total_changes
 
 
 # ==================== TVHEADEND CLIENT ====================
@@ -661,6 +671,7 @@ class TVHClient:
         """Delete mux"""
         logger = logging.getLogger('tvheadend_m3u_sync')
 
+        logger.debug(f"delete_mux called for: {mux.name} (UUID: {mux.uuid})")
 
         if self.dry_run:
             logger.info(f"[DRY RUN] Would delete mux: {mux.name} -> {mux.url}")
@@ -675,7 +686,7 @@ class TVHClient:
             "uuid": json.dumps(uuid_array)
         }
 
-
+        logger.debug(f"Sending delete request for UUID: {mux.uuid}")
         response = self._post_request("api/idnode/delete", data)
         response.raise_for_status()
         logger.info(f"Deleted mux: {mux.name} -> {mux.url}")
@@ -809,16 +820,29 @@ def confirm_uuid_assignment(m3u_entries: List[Entry], existing_muxes: List[Mux])
     """Ask user for confirmation to assign UUIDs in dry run mode"""
     logger = logging.getLogger('tvheadend_m3u_sync')
 
-    # Count entries that would get UUIDs assigned
+    # Count entries that need UUID assignment or correction
     entries_without_uuid = [e for e in m3u_entries if not e.tvh_uuid]
-    if not entries_without_uuid:
-        logger.info("No entries need UUID assignment")
+    entries_with_wrong_uuid = []
+
+    # Check for entries with UUIDs that don't match any existing mux
+    for entry in m3u_entries:
+        if entry.tvh_uuid:
+            # Check if this UUID exists in any mux
+            uuid_exists = any(mux.uuid == entry.tvh_uuid for mux in existing_muxes)
+            if not uuid_exists:
+                entries_with_wrong_uuid.append(entry)
+
+    total_entries_to_fix = len(entries_without_uuid) + len(entries_with_wrong_uuid)
+
+    if total_entries_to_fix == 0:
+        logger.info("No entries need UUID assignment or correction")
         return False
 
     logger.info(f"Found {len(entries_without_uuid)} entries in m3u file without UUIDs")
+    logger.info(f"Found {len(entries_with_wrong_uuid)} entries with incorrect UUIDs")
     logger.info(f"Found {len(existing_muxes)} existing muxes for potential mapping")
 
-    print(f"\nWould you like to assign UUIDs to {len(entries_without_uuid)} entries based on existing muxes?")
+    print(f"\nWould you like to assign/correct UUIDs for {total_entries_to_fix} entries based on existing muxes?")
     print("This will map channels by name and assign corresponding UUIDs.")
 
     while True:
@@ -1009,14 +1033,14 @@ def sync_mode(args, config: Config):
         logger.info("UUID dry run mode enabled")
         if confirm_uuid_assignment(m3u_entries, network_muxes):
             # Map channels by name and assign UUIDs (NOT in dry run mode for actual assignment)
-            m3u_entries, mapped_count = map_channels_by_name(m3u_entries, network_muxes, dry_run=False)
+            m3u_entries, total_changes = map_channels_by_name(m3u_entries, network_muxes, dry_run=False)
 
-            if mapped_count > 0:
-                logger.info(f"Assigned UUIDs to {mapped_count} entries")
+            if total_changes > 0:
+                logger.info(f"Assigned/corrected UUIDs for {total_changes} entries")
                 # Show what was updated
                 for entry in m3u_entries:
                     if entry.tvh_uuid:
-                        logger.info(f"Assigned UUID {entry.tvh_uuid} to: {entry.name}")
+                        logger.info(f"Final UUID {entry.tvh_uuid} for: {entry.name}")
 
                 # Ask if user wants to actually update the M3U file
                 print(f"\nWould you like to update the M3U file with these UUID assignments?")
@@ -1044,7 +1068,7 @@ def sync_mode(args, config: Config):
                         logger.info("M3U file update cancelled by user (EOF)")
                         break
             else:
-                logger.info("No UUID assignments would be made")
+                logger.info("No UUID assignments or corrections would be made")
         else:
             logger.info("UUID assignment cancelled by user")
         return
@@ -1133,18 +1157,26 @@ def sync_mode(args, config: Config):
 
     # Find muxes for the network which have URLs not found in M3U file
     # Should only happen if user removed entry from M3U
-    muxes = [mux for mux in client.get_muxes() if mux.network_uuid == current_network.uuid]
+    # Get current muxes after all updates/creations
+    current_muxes = [mux for mux in client.get_muxes() if mux.network_uuid == current_network.uuid]
+    logger.debug(f"Checking {len(current_muxes)} current muxes for deletion")
 
 
-    if muxes:
+    if current_muxes:
         deleted_count = 0
-        for mux in muxes:
-            if not any(entry.url == mux.url for entry in m3u_entries):
+        for mux in current_muxes:
+            logger.debug(f"Checking mux for deletion: {mux.name} ({mux.url})")
+            matching_entries = [entry for entry in m3u_entries if entry.url == mux.url]
+            if not matching_entries:
                 if deleted_count == 0:
                     logger.info(f"Deleting old muxes from network {current_network.name}...")
                 logger.info(f"Deleting old mux: {mux.name} ({mux.url})")
                 client.delete_mux(mux)
                 deleted_count += 1
+            else:
+                logger.debug(f"Mux {mux.name} found in M3U entries, keeping it")
+                for entry in matching_entries:
+                    logger.debug(f"  Matches M3U entry: {entry.name} ({entry.url})")
 
 
         if deleted_count == 0:
