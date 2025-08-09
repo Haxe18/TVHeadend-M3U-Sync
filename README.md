@@ -142,10 +142,11 @@ Automatically maps M3U entries to existing TVHeadend muxes by normalized channel
 
 ### Interactive UUID Assignment (`--uuid-dry-run`)
 Interactive mode for assigning existing mux UUIDs to M3U entries:
-1. **First prompt**: "Proceed with UUID assignment?" (y/n)
-2. **If yes**: Maps channels by name and assigns UUIDs
-3. **Second prompt**: "Update M3U file with UUIDs?" (y/n)
-4. **If yes**: Updates M3U file with assigned UUIDs
+1. Checks first whether entries are actually assignable/correctable (URL/name match). No prompt if nothing actionable.
+2. **First prompt**: "Proceed with UUID assignment?" (y/n)
+3. **If yes**: Maps by URL (preferred) or by name and assigns/corrects UUIDs
+4. **Second prompt**: "Update M3U file with UUIDs?" (y/n)
+5. **If yes**: Updates the M3U file
 
 **Use cases:**
 - Prepare M3U files with correct UUIDs for future syncs
@@ -197,7 +198,7 @@ max_retries = 3
 
 ### Standard Logging
 ```
-2025-07-15 10:30:15 - tvheadend_m3u_sync - INFO - Starting TVHeadend M3U Sync v1.0.0
+2025-07-15 10:30:15 - tvheadend_m3u_sync - INFO - Starting TVHeadend M3U Sync v1.1.0
 2025-07-15 10:30:15 - tvheadend_m3u_sync - INFO - Found 150 entries in M3U file
 2025-07-15 10:30:16 - tvheadend_m3u_sync - INFO - Using network: IPTV Network (UUID: abc123)
 2025-07-15 10:30:17 - tvheadend_m3u_sync - INFO - Synchronization completed successfully
@@ -210,6 +211,14 @@ python tvheadend_m3u_sync.py --json-log
 ```json
 {"timestamp": "2024-01-15T10:30:15.123456", "level": "INFO", "logger": "tvheadend_m3u_sync", "message": "Starting sync", "module": "tvheadend_m3u_sync", "function": "sync_mode", "line": 123}
 ```
+
+### Inline Diff Highlighting (v1.1)
+
+For mux updates the tool prints a colorized inline diff to the console:
+- URL: character-level
+- Name: word-level
+
+Colors use ANSI escape sequences (works in PowerShell 7 / Windows Terminal). If you write logs to a file, the ANSI codes will be included; to avoid that, use the `--no-color` flag or disable colored output for file logging.
 
 ### Log Levels
 - **INFO**: Important operations and results

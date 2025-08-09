@@ -20,6 +20,7 @@ import logging
 import argparse
 import signal
 import time
+import difflib
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
@@ -31,7 +32,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import configparser
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Global flag for graceful shutdown
 _shutdown_requested = False
@@ -166,6 +167,64 @@ def setup_logging(verbose: bool = False, log_file: Optional[str] = None, json_fo
 
 
 # ==================== DATA MODELS ====================
+
+# ==================== DIFF UTILITIES ====================
+
+ANSI_GREEN = "\x1b[32m"
+ANSI_RED = "\x1b[31m"
+ANSI_RESET = "\x1b[0m"
+COLOR_ENABLED = True
+
+def set_color_enabled(enabled: bool) -> None:
+    global COLOR_ENABLED
+    COLOR_ENABLED = enabled
+
+def _wrap_green(text: str) -> str:
+    if not text:
+        return text
+    if not COLOR_ENABLED:
+        return text
+    return f"{ANSI_GREEN}{text}{ANSI_RESET}"
+
+def _wrap_red(text: str) -> str:
+    if not text:
+        return text
+    if not COLOR_ENABLED:
+        return text
+    return f"{ANSI_RED}{text}{ANSI_RESET}"
+
+def inline_diff(old: str, new: str, by: str = "word") -> Tuple[str, str]:
+    """Return two strings with inline ANSI-colored differences.
+    Old string highlights removed/replaced parts in red.
+    New string highlights added/replaced parts in green.
+    by: 'word' or 'char'
+    """
+    if by == "word":
+        a = old.split()
+        b = new.split()
+        joiner = " "
+    else:
+        a = list(old)
+        b = list(new)
+        joiner = ""
+
+    matcher = difflib.SequenceMatcher(a=a, b=b)
+    old_out: List[str] = []
+    new_out: List[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            old_out.extend(a[i1:i2])
+            new_out.extend(b[j1:j2])
+        elif tag == "delete":
+            old_out.append(_wrap_red(joiner.join(a[i1:i2])))
+        elif tag == "insert":
+            new_out.append(_wrap_green(joiner.join(b[j1:j2])))
+        elif tag == "replace":
+            old_out.append(_wrap_red(joiner.join(a[i1:i2])))
+            new_out.append(_wrap_green(joiner.join(b[j1:j2])))
+
+    return joiner.join(old_out), joiner.join(new_out)
+
 
 @dataclass
 class ModelBase:
@@ -757,25 +816,37 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full synchronization with environment variables (recommended for security)
+  # 1) Full sync using environment variables (recommended)
   export TVH_URL="http://tvheadend:9981"
   export TVH_USERNAME="admin"
   export TVH_PASSWORD="password"
   %(prog)s -m playlist.m3u -n "IPTV Network"
 
-  # Auto-generated network name from M3U filename
-  %(prog)s -m my_channels.m3u --url http://tvheadend:9981  # Network: "my channels"
+  # 2) Auto-generate network name from file name
+  %(prog)s -m my_channels.m3u --url http://tvheadend:9981   # Network: "my channels"
 
-  # Full synchronization with config file
+  # 3) Use a config file
   %(prog)s --config /path/to/config.ini -m playlist.m3u -n "IPTV Network"
 
-  # Full synchronization with command line (flexible order)
+  # 4) Full CLI-based sync (order flexible)
   %(prog)s -m playlist.m3u -n "IPTV Network" --url http://tvheadend:9981 -u admin -p password
 
-  # Dry run preview
+  # 5) Dry-run preview
   %(prog)s --dry-run -m playlist.m3u -n "IPTV Network" --url http://localhost:9981
 
-  # Arguments can be in any order
+  # 6) Map by name (existing muxes), with verbose logging
+  %(prog)s --map-by-name -v -m playlist.m3u -n "IPTV Network" --url http://localhost:9981
+
+  # 7) Interactive UUID assignment (URL first, then name). Only prompts if actionable.
+  %(prog)s --uuid-dry-run -m playlist.m3u -n "IPTV Network" --url http://localhost:9981
+
+  # 8) JSON logs (colors off automatically), log to file
+  %(prog)s --json-log --log-file sync.jsonl -m playlist.m3u -n "IPTV Network" --url http://localhost:9981
+
+  # 9) Disable ANSI colors explicitly
+  %(prog)s --no-color -m playlist.m3u -n "IPTV Network" --url http://localhost:9981
+
+  # 10) Arguments can be in any order
   %(prog)s --url http://localhost:9981 -m channels.m3u -n "My IPTV"
         """
     )
@@ -798,6 +869,7 @@ Examples:
     parser.add_argument('--config', help='Configuration file path')
     parser.add_argument('--log-file', help='Log to file instead of console')
     parser.add_argument('--json-log', action='store_true', help='Use JSON log format')
+    parser.add_argument('--no-color', action='store_true', help='Disable ANSI colors in console output')
     parser.add_argument('--timeout', type=int, default=30, help='HTTP request timeout in seconds')
     parser.add_argument('--dry-run', action='store_true', help='Preview changes without applying them')
     parser.add_argument('--map-by-name', action='store_true', help='Map channels by name when syncing to existing muxes')
@@ -816,54 +888,73 @@ Examples:
 
 # ==================== USER INTERACTION ====================
 
-def confirm_uuid_assignment(m3u_entries: List[Entry], existing_muxes: List[Mux]) -> bool:
-    """Ask user for confirmation to assign UUIDs in dry run mode"""
+def confirm_uuid_assignment(m3u_entries: List[Entry], existing_muxes: List[Mux]) -> Tuple[bool, str]:
+    """Ask user for confirmation to assign/correct UUIDs in dry run mode.
+
+    Returns:
+        (proceed, reason):
+          - proceed True/False whether to proceed
+          - reason one of: 'proceed', 'no_actionable', 'user_cancel'
+    """
     logger = logging.getLogger('tvheadend_m3u_sync')
 
-    # Count entries that need UUID assignment or correction
-    entries_without_uuid = [e for e in m3u_entries if not e.tvh_uuid]
-    entries_with_wrong_uuid = []
+    # Build quick lookup for URL and name matches
+    def find_url_match(entry: Entry) -> Optional[Mux]:
+        return next((m for m in existing_muxes if m.url == entry.url), None)
 
-    # Check for entries with UUIDs that don't match any existing mux
+    def find_name_match(entry: Entry) -> Optional[Mux]:
+        return find_matching_mux_by_name(entry, existing_muxes)
+
+    # Determine only actionable entries (those that can actually be mapped/corrected)
+    actionable_without_uuid: List[Entry] = []
+    actionable_wrong_uuid: List[Entry] = []
+
     for entry in m3u_entries:
-        if entry.tvh_uuid:
-            # Check if this UUID exists in any mux
+        url_match = find_url_match(entry)
+        name_match = find_name_match(entry) if url_match is None else None
+
+        if not entry.tvh_uuid:
+            if url_match is not None or name_match is not None:
+                actionable_without_uuid.append(entry)
+        else:
             uuid_exists = any(mux.uuid == entry.tvh_uuid for mux in existing_muxes)
             if not uuid_exists:
-                entries_with_wrong_uuid.append(entry)
+                # Only actionable if we have a way to determine the correct UUID
+                if url_match is not None or name_match is not None:
+                    actionable_wrong_uuid.append(entry)
 
-    total_entries_to_fix = len(entries_without_uuid) + len(entries_with_wrong_uuid)
+    total_actionable = len(actionable_without_uuid) + len(actionable_wrong_uuid)
 
-    if total_entries_to_fix == 0:
-        logger.info("No entries need UUID assignment or correction")
-        return False
+    if total_actionable == 0:
+        logger.info("No entries can be assigned/corrected (new channels or no matches)")
+        return False, 'no_actionable'
 
-    logger.info(f"Found {len(entries_without_uuid)} entries in m3u file without UUIDs")
-    logger.info(f"Found {len(entries_with_wrong_uuid)} entries with incorrect UUIDs")
+    logger.info(f"Found {len(actionable_without_uuid)} entries without UUIDs that can be mapped")
+    logger.info(f"Found {len(actionable_wrong_uuid)} entries with incorrect UUIDs that can be corrected")
     logger.info(f"Found {len(existing_muxes)} existing muxes for potential mapping")
 
-    print(f"\nWould you like to assign/correct UUIDs for {total_entries_to_fix} entries based on existing muxes?")
-    print("This will map channels by name and assign corresponding UUIDs.")
+    print(f"\nWould you like to assign/correct UUIDs for {total_actionable} entries based on existing muxes?")
+    print("This will match by URL and fall back to name to assign corresponding UUIDs.")
 
     while True:
         try:
             check_shutdown()  # Check for graceful shutdown before input
             response = input("Proceed with UUID assignment? (y/n): ").strip().lower()
             if response in ['y', 'yes']:
-                return True
+                return True, 'proceed'
             elif response in ['n', 'no']:
-                return False
+                return False, 'user_cancel'
             else:
                 print("Please enter 'y' or 'n'")
         except KeyboardInterrupt:
             print()  # New line after Ctrl+C
             logger.info("UUID assignment cancelled by user (Ctrl+C)")
-            return False
+            return False, 'user_cancel'
         except EOFError:
             # Handle Ctrl+D
             print()
             logger.info("UUID assignment cancelled by user (EOF)")
-            return False
+            return False, 'user_cancel'
 
 
 # ==================== MAIN PROGRAM ====================
@@ -887,6 +978,10 @@ def main():
         )
         logger = logging.getLogger('tvheadend_m3u_sync')
 
+
+        # Configure color output
+        if getattr(args, 'no_color', False) or getattr(args, 'json_log', False):
+            set_color_enabled(False)
 
         logger.info(f"Starting TVHeadend M3U Sync v{__version__}")
 
@@ -1031,7 +1126,8 @@ def sync_mode(args, config: Config):
         # Handle UUID dry run mode
     if getattr(args, 'uuid_dry_run', False):
         logger.info("UUID dry run mode enabled")
-        if confirm_uuid_assignment(m3u_entries, network_muxes):
+        proceed, reason = confirm_uuid_assignment(m3u_entries, network_muxes)
+        if proceed:
             # Map channels by name and assign UUIDs (NOT in dry run mode for actual assignment)
             m3u_entries, total_changes = map_channels_by_name(m3u_entries, network_muxes, dry_run=False)
 
@@ -1070,7 +1166,10 @@ def sync_mode(args, config: Config):
             else:
                 logger.info("No UUID assignments or corrections would be made")
         else:
-            logger.info("UUID assignment cancelled by user")
+            if reason == 'no_actionable':
+                logger.info("No entries to assign/correct; skipping UUID assignment")
+            else:
+                logger.info("UUID assignment cancelled by user")
         return
 
     # Handle name-based mapping for existing muxes
@@ -1090,13 +1189,15 @@ def sync_mode(args, config: Config):
 
 
             if mux.url != match.url:
-                logger.info(f"Mux {mux.name} URL changed: {mux.url} -> {match.url}")
+                old_d, new_d = inline_diff(mux.url or "", match.url or "", by="char")
+                logger.info(f"Mux {mux.name} URL changed:\n  - {old_d}\n  + {new_d}")
                 mux.url = match.url
                 needs_update = True
 
 
             if mux.name != match.name:
-                logger.info(f"Mux name changed: {mux.name} -> {match.name}")
+                old_d, new_d = inline_diff(mux.name or "", match.name or "", by="word")
+                logger.info(f"Mux name changed:\n  - {old_d}\n  + {new_d}")
                 mux.name = match.name
                 needs_update = True
 
@@ -1157,26 +1258,38 @@ def sync_mode(args, config: Config):
 
     # Find muxes for the network which have URLs not found in M3U file
     # Should only happen if user removed entry from M3U
-    # Get current muxes after all updates/creations
-    current_muxes = [mux for mux in client.get_muxes() if mux.network_uuid == current_network.uuid]
-    logger.debug(f"Checking {len(current_muxes)} current muxes for deletion")
+    # Determine mux list for deletion check
+    if args.dry_run:
+        # In dry run, use simulated in-memory state (includes name/url changes)
+        current_muxes = network_muxes
+        logger.debug(f"[DRY RUN] Using simulated mux state for deletion check: {len(current_muxes)} muxes")
+    else:
+        # In real run, refetch actual state from server after updates/creations
+        current_muxes = [mux for mux in client.get_muxes() if mux.network_uuid == current_network.uuid]
+        logger.debug(f"Checking {len(current_muxes)} current muxes for deletion")
 
 
     if current_muxes:
         deleted_count = 0
         for mux in current_muxes:
             logger.debug(f"Checking mux for deletion: {mux.name} ({mux.url})")
+            has_uuid_match = any(entry.tvh_uuid == mux.uuid for entry in m3u_entries)
             matching_entries = [entry for entry in m3u_entries if entry.url == mux.url]
-            if not matching_entries:
+            has_url_match = len(matching_entries) > 0
+            if not has_uuid_match and not has_url_match:
                 if deleted_count == 0:
-                    logger.info(f"Deleting old muxes from network {current_network.name}...")
-                logger.info(f"Deleting old mux: {mux.name} ({mux.url})")
+                    if args.dry_run:
+                        logger.info(f"[DRY RUN] Would delete old muxes from network {current_network.name}...")
+                    else:
+                        logger.info(f"Deleting old muxes from network {current_network.name}...")
+                # Per-mux delete logging is handled inside client.delete_mux
                 client.delete_mux(mux)
                 deleted_count += 1
             else:
-                logger.debug(f"Mux {mux.name} found in M3U entries, keeping it")
+                reason = "UUID" if has_uuid_match else "URL"
+                logger.debug(f"Mux {mux.name} kept due to {reason} match")
                 for entry in matching_entries:
-                    logger.debug(f"  Matches M3U entry: {entry.name} ({entry.url})")
+                    logger.debug(f"  URL match with M3U entry: {entry.name} ({entry.url})")
 
 
         if deleted_count == 0:
