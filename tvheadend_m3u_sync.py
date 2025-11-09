@@ -88,8 +88,8 @@ class Config:
             'TVH_NETWORK': 'network_name',
             'TVH_M3U_FILE': 'm3u_file',
             'TVH_AUTH_TYPE': 'auth_type',
-            'TVH_SYNC_PLAYLIST_ONLY': 'sync_playlist_channels_only'
-        }
+            'TVH_SYNC_PLAYLIST_ONLY': 'sync_playlist_channels_only',
+            'TVH_ENABLE_AUTO_SCAN' : 'enable_auto_scan'}
 
         for env_var, config_key in env_mappings.items():
             value = os.getenv(env_var)
@@ -652,23 +652,37 @@ class TVHClient:
         response.raise_for_status()
         return response.json()
 
-    def create_new_iptv_network(self, name: str):
-        """Create new IPTV network"""
+    def create_new_iptv_network(self, name: str, auto_scan: bool = False):
         logger = logging.getLogger('tvheadend_m3u_sync')
 
         if self.dry_run:
             logger.info(f"[DRY RUN] Would create new IPTV network: {name}")
             return
 
-        conf_data = {
-            "enabled": True,
-            "max_timeout": 10,
-            "networkname": name,
-            "pnetworkname": name,
-            "bouquet": True,
-            "scan_create": 1,
-            "max_streams": 0
-        }
+        if auto_scan:
+            conf_data = {
+                "enabled": True,
+                "max_timeout": 10,
+                "networkname": name,
+                "pnetworkname": name,
+                "bouquet": True,
+                "scan_create": 1,
+                "max_streams": 0
+            }
+            logger.info(f"Creating IPTV network '{name}' with auto-scan enabled")
+        else:
+            conf_data = {
+                "enabled": False,
+                "max_timeout": 10,
+                "networkname": name,
+                "pnetworkname": name,
+                "bouquet": False,
+                "scan_create": 0,
+                "max_streams": 0,
+                "autodiscovery": 0,
+                "skipinitscan": True
+            }
+            logger.info(f"Creating IPTV network '{name}' with all scanning disabled")
 
         data = {
             "class": "iptv_network",
@@ -878,9 +892,9 @@ Examples:
     parser.add_argument('--dry-run', action='store_true', help='Preview changes without applying them')
     parser.add_argument('--map-by-name', action='store_true', help='Map channels by name when syncing to existing muxes')
     parser.add_argument('--uuid-dry-run', action='store_true', help='Interactive UUID assignment mode: map channels by name and assign existing mux UUIDs to M3U entries with user confirmation')
-    parser.add_argument('--sync-playlist-channels-only', '--playlist-only',
-                       action='store_true', dest='sync_playlist_channels_only',
-                       help='Sync only playlist channels, preserve all other channels in TVHeadend')
+    parser.add_argument('--sync-playlist-channels-only', '--playlist-only', action='store_true', dest='sync_playlist_channels_only', help='Sync only playlist channels, preserve all other channels in TVHeadend')
+    parser.add_argument('--enable-auto-scan', action='store_true',help='Enable automatic network scanning and bouquet creation (disabled by default)')
+
 
 
     args = parser.parse_args()
@@ -1125,7 +1139,16 @@ def sync_mode(args, config: Config):
 
         # Get or create network
         logger.debug(f"Getting/creating network: {network_name}")
-        current_network = get_network(network_name, client)
+# Determine auto-scan behavior from CLI or environment
+        auto_scan = getattr(args, "enable_auto_scan", False)
+        if not auto_scan:
+            conf_val = config.get("enable_auto_scan", "")
+        if isinstance(conf_val, str):
+            auto_scan = conf_val.lower() in ("1", "true", "yes", "on")
+        else:
+            auto_scan = bool(conf_val)
+        current_network = get_network(network_name, client, auto_scan=auto_scan)
+
         logger.info(f"Using network: {current_network.name} (UUID: {current_network.uuid})")
     except Exception as e:
         logger.error(f"Failed to initialize TVHeadend client: {e}")
@@ -1343,19 +1366,15 @@ def sync_mode(args, config: Config):
             logger.info(f"Summary: Updated {updated_count} channels, created {created_count} new channels, deleted {deleted_count} old channels")
         logger.info("Synchronization completed successfully")
 
-
-def get_network(network_name_to_sync: str, client: TVHClient) -> Network:
+def get_network(network_name_to_sync: str, client: TVHClient, auto_scan: bool = False) -> Network:
     """Get existing network or create new one"""
     logger = logging.getLogger('tvheadend_m3u_sync')
-
 
     logger.debug("Fetching existing networks...")
     networks = client.get_networks()
     logger.debug(f"Found {len(networks)} networks")
 
-
     work_network = next((network for network in networks if network.name == network_name_to_sync), None)
-
 
     if work_network is None:
         if client.dry_run:
@@ -1367,8 +1386,7 @@ def get_network(network_name_to_sync: str, client: TVHClient) -> Network:
             )
         else:
             logger.info(f"Network '{network_name_to_sync}' not found, creating new IPTV network...")
-            client.create_new_iptv_network(network_name_to_sync)
-
+            client.create_new_iptv_network(network_name_to_sync, auto_scan=auto_scan)
 
             # Refetch and find the new network
             networks = client.get_networks()
@@ -1377,9 +1395,7 @@ def get_network(network_name_to_sync: str, client: TVHClient) -> Network:
     else:
         logger.debug(f"Using existing network: {work_network.name}")
 
-
     return work_network
-
 
 if __name__ == "__main__":
     main()
