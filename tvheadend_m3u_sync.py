@@ -32,7 +32,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import configparser
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Global flag for graceful shutdown
 _shutdown_requested = False
@@ -256,6 +256,7 @@ class Mux(ModelBase):
     network_name: Optional[str] = None
     network_uuid: Optional[str] = None
     url: Optional[str] = None
+    svc_name: Optional[str] = None
 
 
 @dataclass
@@ -689,7 +690,8 @@ class TVHClient:
             logger.debug(f"[DRY RUN] Would assign UUID: {fake_uuid}")
             return fake_uuid
         conf_data = {
-            "Enabled": True, "epg": False, "iptv_url": entry.url, "iptv_muxname": entry.name, "scan_state": 0
+            "Enabled": True, "epg": False, "iptv_url": entry.url, "iptv_muxname": entry.name,
+            "iptv_sname": entry.name, "scan_state": 0
         }
 
         data = {
@@ -714,6 +716,7 @@ class TVHClient:
         node_data = {
             "uuid": mux.uuid,
             "iptv_muxname": mux.name,
+            "iptv_sname": mux.svc_name if mux.svc_name is not None else mux.name,
             "iptv_url": mux.url
         }
 
@@ -800,7 +803,8 @@ class TVHClient:
                 enabled=entry.get("enabled", False),
                 network_name=entry.get("networkname"),
                 network_uuid=entry.get("network_uuid"),
-                url=entry.get("iptv_url")
+                url=entry.get("iptv_url"),
+                svc_name=entry.get("iptv_sname")
             )
             muxes.append(mux)
 
@@ -1214,6 +1218,13 @@ def sync_mode(args, config: Config):
                 old_d, new_d = inline_diff(mux.name or "", match.name or "", by="word")
                 logger.info(f"Mux name changed:\n  - {old_d}\n  + {new_d}")
                 mux.name = match.name
+                needs_update = True
+
+
+            if mux.svc_name != match.name:
+                old_d, new_d = inline_diff(mux.svc_name or "", match.name or "", by="word")
+                logger.info(f"Service name changed:\n  - {old_d}\n  + {new_d}")
+                mux.svc_name = match.name
                 needs_update = True
 
 
